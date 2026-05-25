@@ -10,6 +10,8 @@ A minimal Terraform setup that reproduces the privilege-escalation primitive fro
 - AWS CLI v2 (`aws configure` with admin credentials, region `us-east-1`)
 - Terraform ≥ 1.5
 - `jq` (for parsing the attack response)
+- Docker or Podman (for Neo4j, used by Cartography)
+- Python 3.11 or 3.12 (Python 3.14 is incompatible with Cartography's asyncio code)
 
 ## Setup
 
@@ -99,6 +101,60 @@ aws --profile pwned iam create-access-key --user-name backdoor-admin
 
 End state: three compromised identities (`compromised_user`, `frick`, `backdoor-admin`), one of which exists entirely outside Terraform state.
 
+## Graph Analysis with Cartography
+
+**1. Start a local Neo4j 5 container:**
+
+```bash
+docker run -d \
+  --name cartography-neo4j \
+  -p 7474:7474 -p 7687:7687 \
+  -e NEO4J_AUTH=none \
+  -e NEO4J_PLUGINS='["apoc"]' \
+  neo4j:5.26-community
+```
+
+Neo4j 5.23 or later is required — Cartography emits Cypher subquery syntax that older versions reject.
+
+**2. Install Cartography in a Python 3.12 venv:**
+
+```bash
+python3.12 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install cartography
+```
+
+**3. Run the sync** using your admin AWS profile (not the attacker profile — Cartography needs broad read access):
+
+```bash
+export AWS_PROFILE=default
+
+cartography --neo4j-uri bolt://localhost:7687 \
+  --selected-modules aws \
+  --aws-requested-syncs "iam,lambda_function,s3" \
+  --aws-regions us-east-1
+```
+
+The restricted flags keep the graph small and the sync fast (~30 seconds). Removing them ingests all AWS services across all enabled regions, which produces a much noisier graph.
+
+**4. Explore the graph** at <http://localhost:7474> (no login, auth is disabled). The minimal case-relevant query:
+
+```cypher
+MATCH path = (anchor)-[*0..2]-(neighbor)
+WHERE (anchor.name IN ['compromised_user', 'frick', 'backdoor-admin',
+                       'EC2-init', 'EC2-init-exec-role']
+       OR (anchor:S3Bucket AND coalesce(anchor.name,'') STARTS WITH 'rag-data-'))
+  AND ALL(node IN nodes(path) WHERE 
+        NOT node:AWSAccount 
+        AND NOT coalesce(node.arn,'') CONTAINS 'foundation-model')
+RETURN path
+```
+
+Excluding `AWSAccount` from path traversal prevents the result from exploding through the account-hub edge. The rendered subgraph shows the privesc-relevant entities — users, policies, statements, Lambda, execution role — without the rest of the account's resources.
+
+If you re-run Cartography after the attack, `backdoor-admin` appears in the graph alongside the other users, since Cartography reflects live cloud state rather than Terraform state.
+
 ## Cleanup
 
 ```bash
@@ -115,9 +171,18 @@ aws iam list-access-keys --user-name frick \
   --query 'AccessKeyMetadata[].AccessKeyId' --output text | \
   xargs -n 1 aws iam delete-access-key --user-name frick --access-key-id
 
-# Tear down everything else
+# Tear down the AWS infrastructure
 terraform destroy
+
+# Stop the Neo4j container
+docker rm -f cartography-neo4j
+
+# Remove the stale AWS profiles
+# Open ~/.aws/credentials and ~/.aws/config in your editor
+# and delete the [attacker] and [pwned] blocks
 ```
+
+If you didn't complete the persistence step (4) of the attack, the `backdoor-admin` and `frick` access-key cleanups will fail with `NoSuchEntity` — that's expected and harmless. Skip them and run `terraform destroy` directly.
 
 ## Repository Structure
 

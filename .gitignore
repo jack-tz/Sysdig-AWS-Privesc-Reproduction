@@ -1,2 +1,12 @@
 # Key for AWS
 keys.txt
+
+# Directories
+.terraform/
+.venv/
+payload/
+
+# Loose files
+*.hcl
+*.zip
+*.tfstate
